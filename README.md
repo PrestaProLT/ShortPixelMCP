@@ -19,17 +19,39 @@ MCP server for optimizing images via the [ShortPixel API](https://shortpixel.com
 
 Sign up at [shortpixel.com](https://shortpixel.com/free-sign-up-referrer/referrer/748277) — you get 100 free credits/month.
 
-### 2. Install
+### 2. Clone & Build
 
 ```bash
+git clone https://github.com/PrestaProLT/ShortPixelMCP.git
 cd ShortPixelMCP
 npm install
 npm run build
 ```
 
-### 3. Configure in Claude Code
+### 3. Register in Claude Code (Recommended)
 
-Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.claude/settings.json`):
+Use the CLI to register the server globally:
+
+```bash
+claude mcp add -s user \
+  -e "SHORTPIXEL_API_KEY=your_api_key_here" \
+  -- shortpixel node /absolute/path/to/ShortPixelMCP/build/index.js
+```
+
+Then restart Claude Code. Verify with:
+
+```bash
+claude mcp list
+```
+
+You should see `shortpixel: ✓ Connected`.
+
+### Alternative: Manual Configuration
+
+<details>
+<summary>Claude Code — manual settings.json</summary>
+
+Add to `~/.claude.json`:
 
 ```json
 {
@@ -44,8 +66,10 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.cla
   }
 }
 ```
+</details>
 
-### 4. Configure in Cursor
+<details>
+<summary>Cursor</summary>
 
 Add to `.cursor/mcp.json`:
 
@@ -62,6 +86,7 @@ Add to `.cursor/mcp.json`:
   }
 }
 ```
+</details>
 
 ## Tools
 
