@@ -157,7 +157,7 @@ function formatBytes(bytes: number): string {
 
 function formatResult(item: Record<string, unknown>): string {
   const status = item.Status as Record<string, unknown> | undefined;
-  const code = status?.Code as number | undefined;
+  const code = Number(status?.Code);
 
   if (code === 1) {
     return `⏳ Image queued for processing. Poll again shortly.\nOriginal: ${item.OriginalURL}`;
@@ -180,11 +180,11 @@ function formatResult(item: Record<string, unknown>): string {
     `Lossless: ${formatBytes(losslessSize)} → ${item.LosslessURL}`,
   ];
 
-  if (item.WebPLossyURL) {
+  if (item.WebPLossyURL && item.WebPLossyURL !== "NA") {
     lines.push(`WebP Lossy: ${formatBytes(item.WebPLossySize as number)} → ${item.WebPLossyURL}`);
     lines.push(`WebP Lossless: ${formatBytes((item.WebPLoselessSize ?? item.WebPLosslessSize) as number)} → ${item.WebPLosslessURL}`);
   }
-  if (item.AVIFLossyURL) {
+  if (item.AVIFLossyURL && item.AVIFLossyURL !== "NA") {
     lines.push(`AVIF Lossy: ${formatBytes(item.AVIFLossySize as number)} → ${item.AVIFLossyURL}`);
     lines.push(`AVIF Lossless: ${formatBytes((item.AVIFLoselessSize ?? item.AVIFLosslessSize) as number)} → ${item.AVIFLosslessURL}`);
   }
@@ -503,7 +503,7 @@ server.tool(
         // Download back if requested
         if (args.download_result) {
           const status = item.Status as Record<string, unknown> | undefined;
-          if (status?.Code === 2 && item.LossyURL) {
+          if (Number(status?.Code) === 2 && item.LossyURL) {
             await downloadFile(item.LossyURL as string, filePath);
             results.push(`${file}: optimized and replaced\n${text}`);
           } else {
@@ -595,10 +595,10 @@ server.tool(
     const item = items[0] as Record<string, unknown>;
     const status = item.Status as Record<string, unknown> | undefined;
 
-    if (status?.Code !== 2) {
+    if (Number(status?.Code) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: status?.Code !== 1,
+        isError: Number(status?.Code) !== 1,
       };
     }
 
@@ -696,10 +696,10 @@ server.tool(
     const item = items[0] as Record<string, unknown>;
     const status = item.Status as Record<string, unknown> | undefined;
 
-    if (status?.Code !== 2) {
+    if (Number(status?.Code) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: status?.Code !== 1,
+        isError: Number(status?.Code) !== 1,
       };
     }
 
@@ -722,7 +722,7 @@ server.tool(
       `| Lossless | ${formatBytes(losslessSize)} | ${((1 - losslessSize / origSize) * 100).toFixed(1)}% | ${item.LosslessURL} |`,
     ];
 
-    if (item.WebPLossyURL) {
+    if (item.WebPLossyURL && item.WebPLossyURL !== "NA") {
       const webpLossySize = item.WebPLossySize as number;
       const webpLosslessSize = (item.WebPLoselessSize ?? item.WebPLosslessSize) as number;
       lines.push(
@@ -733,7 +733,7 @@ server.tool(
       );
     }
 
-    if (item.AVIFLossyURL) {
+    if (item.AVIFLossyURL && item.AVIFLossyURL !== "NA") {
       const avifLossySize = item.AVIFLossySize as number;
       const avifLosslessSize = (item.AVIFLoselessSize ?? item.AVIFLosslessSize) as number;
       lines.push(
@@ -749,8 +749,8 @@ server.tool(
       { name: `${args.compression}`, size: lossySize },
       { name: "Lossless", size: losslessSize },
     ];
-    if (item.WebPLossySize) candidates.push({ name: "WebP Lossy", size: item.WebPLossySize as number });
-    if (item.AVIFLossySize) candidates.push({ name: "AVIF Lossy", size: item.AVIFLossySize as number });
+    if (item.WebPLossySize && item.WebPLossySize !== "NA") candidates.push({ name: "WebP Lossy", size: item.WebPLossySize as number });
+    if (item.AVIFLossySize && item.AVIFLossySize !== "NA") candidates.push({ name: "AVIF Lossy", size: item.AVIFLossySize as number });
 
     const best = candidates.reduce((a, b) => (a.size < b.size ? a : b));
     lines.push(``);
@@ -847,20 +847,20 @@ server.tool(
     const item = items[0] as Record<string, unknown>;
     const status = item.Status as Record<string, unknown> | undefined;
 
-    if (status?.Code !== 2) {
+    if (Number(status?.Code) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: status?.Code !== 1,
+        isError: Number(status?.Code) !== 1,
       };
     }
 
     // Pick the right URL based on convert_to
     let downloadUrl: string;
     let formatLabel: string;
-    if (args.convert_to === "webp" && item.WebPLossyURL) {
+    if (args.convert_to === "webp" && item.WebPLossyURL && item.WebPLossyURL !== "NA") {
       downloadUrl = (args.compression === "lossless" ? item.WebPLosslessURL : item.WebPLossyURL) as string;
       formatLabel = `WebP (${args.compression})`;
-    } else if (args.convert_to === "avif" && item.AVIFLossyURL) {
+    } else if (args.convert_to === "avif" && item.AVIFLossyURL && item.AVIFLossyURL !== "NA") {
       downloadUrl = (args.compression === "lossless" ? item.AVIFLosslessURL : item.AVIFLossyURL) as string;
       formatLabel = `AVIF (${args.compression})`;
     } else {
