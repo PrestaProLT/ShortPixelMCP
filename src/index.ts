@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as http from "node:http";
 import * as https from "node:https";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -129,7 +130,8 @@ async function uploadFile(
 async function downloadFile(url: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const follow = (targetUrl: string) => {
-      https.get(targetUrl, (res) => {
+      const getter = targetUrl.startsWith("https://") ? https.get : http.get;
+      getter(targetUrl, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           follow(res.headers.location);
           return;
