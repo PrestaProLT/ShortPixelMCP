@@ -6,11 +6,13 @@ MCP server for optimizing images via the [ShortPixel API](https://shortpixel.com
 
 - **optimize** — Optimize images by URL (up to 100 at once) with lossy/glossy/lossless compression
 - **optimize-file** — Upload and optimize local image files
+- **optimize-and-save** — Optimize a single image (URL or local file) and save the result in one step
 - **batch-optimize** — Optimize all images in a directory
+- **resize** — Resize/crop images with outer fit, inner fit, or AI smart crop
+- **compare** — Compare before/after optimization with a detailed report of all format variants
 - **download** — Download optimized results to local filesystem
 - **check-quota** — Check your remaining API credits
 - WebP and AVIF conversion
-- Resize and smart AI crop
 - EXIF metadata preservation
 
 ## Setup
@@ -137,6 +139,41 @@ Download an optimized image to local filesystem.
 |-----------|------|-------------|
 | url | string | ShortPixel result URL |
 | dest_path | string | Absolute local destination path |
+
+### resize
+
+Resize or crop an image by URL or local file. Downloads the resized result directly.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| source | string | required | Image URL or absolute local file path |
+| width | number | required | Target width in pixels |
+| height | number | required | Target height in pixels |
+| mode | outer/inner/smart_crop | inner | Resize mode |
+| compression | lossy/glossy/lossless | lossless | Compression mode |
+| dest_path | string | required | Absolute local path to save result |
+
+### compare
+
+Compare an image before and after optimization. Shows a table of all format variants with sizes and savings.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| source | string | required | Image URL or absolute local file path |
+| compression | lossy/glossy/lossless | lossy | Compression mode to compare |
+| convert_to | none/webp/avif/webp+avif | webp+avif | Also compare converted formats |
+
+### optimize-and-save
+
+Optimize a single image (URL or local file) and save the optimized result locally. If no `dest_path` is given and the source is a local file, replaces the original.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| source | string | required | Image URL or absolute local file path |
+| dest_path | string | optional | Local path to save result (defaults to replacing original for local files) |
+| compression | lossy/glossy/lossless | lossy | Compression mode |
+| convert_to | none/webp/avif | none | Convert to a different format |
+| keep_exif | boolean | false | Preserve EXIF metadata |
 
 ### check-quota
 

@@ -66,6 +66,13 @@ async function uploadFile(
   const fileData = fs.readFileSync(filePath);
   const boundary = `----MCPBoundary${Date.now()}`;
 
+  // The ShortPixel API requires file_paths to map a field name to the local path,
+  // and the multipart file field must use the same field name as the key.
+  const fileFieldName = "file1";
+
+  // Override file_paths to use the correct field name
+  body.file_paths = JSON.stringify({ [fileFieldName]: filePath });
+
   // Build multipart form data
   const parts: Buffer[] = [];
 
@@ -78,10 +85,10 @@ async function uploadFile(
     );
   }
 
-  // Add file
+  // Add file — field name must match the key in file_paths
   parts.push(
     Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${fileName}"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
+      `--${boundary}\r\nContent-Disposition: form-data; name="${fileFieldName}"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
     )
   );
   parts.push(fileData);
@@ -515,6 +522,367 @@ server.tool(
         {
           type: "text",
           text: `Processed ${files.length} files from ${args.directory}\n\n${results.join("\n\n---\n\n")}`,
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool: resize ───────────────────────────────────────────────────────────
+
+server.tool(
+  "resize",
+  "Resize or crop an image by URL or local file. Supports outer fit, inner fit, and AI smart crop. " +
+    "Downloads the resized result to a local path.",
+  {
+    source: z.string().describe("Image URL or absolute local file path"),
+    width: z.number().int().positive().describe("Target width in pixels"),
+    height: z.number().int().positive().describe("Target height in pixels"),
+    mode: z
+      .enum(["outer", "inner", "smart_crop"])
+      .default("inner")
+      .describe("Resize mode: outer (cover, may crop), inner (contain, fits within), smart_crop (AI-powered crop)"),
+    compression: z
+      .enum(["lossy", "glossy", "lossless"])
+      .default("lossless")
+      .describe("Compression mode"),
+    dest_path: z.string().describe("Absolute local path to save the resized image"),
+  },
+  async (args) => {
+    const key = requireApiKey();
+    const lossyMap = { lossy: 1, glossy: 2, lossless: 0 };
+    const resizeMap = { outer: 1, inner: 3, smart_crop: 4 };
+
+    const isUrl = args.source.startsWith("http://") || args.source.startsWith("https://");
+    let result: unknown;
+
+    if (isUrl) {
+      result = await postJson("reducer.php", {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        resize: resizeMap[args.mode],
+        resize_width: args.width,
+        resize_height: args.height,
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: 0,
+        urllist: [args.source],
+      });
+    } else {
+      if (!fs.existsSync(args.source)) {
+        return {
+          content: [{ type: "text", text: `Error: File not found: ${args.source}` }],
+          isError: true,
+        };
+      }
+      const fileName = path.basename(args.source);
+      result = await uploadFile(args.source, {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        resize: resizeMap[args.mode],
+        resize_width: args.width,
+        resize_height: args.height,
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: 0,
+        file_paths: JSON.stringify({ [fileName]: args.source }),
+      });
+    }
+
+    const items = Array.isArray(result) ? result : [result];
+    const item = items[0] as Record<string, unknown>;
+    const status = item.Status as Record<string, unknown> | undefined;
+
+    if (status?.Code !== 2) {
+      return {
+        content: [{ type: "text", text: formatResult(item) }],
+        isError: status?.Code !== 1,
+      };
+    }
+
+    // Download the lossy result (which has the resize applied)
+    const downloadUrl = (item.LossyURL ?? item.LosslessURL) as string;
+    const dir = path.dirname(args.dest_path);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    await downloadFile(downloadUrl, args.dest_path);
+    const stat = fs.statSync(args.dest_path);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Resized (${args.mode}) to ${args.width}x${args.height} → ${args.dest_path} (${formatBytes(stat.size)})\n\n${formatResult(item)}`,
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool: compare ──────────────────────────────────────────────────────────
+
+server.tool(
+  "compare",
+  "Compare an image before and after optimization. Shows original vs optimized sizes, savings percentage, " +
+    "and all available format variants. Works with URLs and local files.",
+  {
+    source: z.string().describe("Image URL or absolute local file path"),
+    compression: z
+      .enum(["lossy", "glossy", "lossless"])
+      .default("lossy")
+      .describe("Compression mode to compare against"),
+    convert_to: z
+      .enum(["none", "webp", "avif", "webp+avif"])
+      .default("webp+avif")
+      .describe("Also compare converted formats"),
+  },
+  async (args) => {
+    const key = requireApiKey();
+    const lossyMap = { lossy: 1, glossy: 2, lossless: 0 };
+    const convertMap: Record<string, string> = {
+      none: "",
+      webp: "+webp",
+      avif: "+avif",
+      "webp+avif": "+webp|+avif",
+    };
+
+    const isUrl = args.source.startsWith("http://") || args.source.startsWith("https://");
+    let result: unknown;
+
+    if (isUrl) {
+      const body: Record<string, unknown> = {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        resize: 0,
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: 0,
+        urllist: [args.source],
+      };
+      if (convertMap[args.convert_to]) {
+        body.convertto = convertMap[args.convert_to];
+      }
+      result = await postJson("reducer.php", body);
+    } else {
+      if (!fs.existsSync(args.source)) {
+        return {
+          content: [{ type: "text", text: `Error: File not found: ${args.source}` }],
+          isError: true,
+        };
+      }
+      const fileName = path.basename(args.source);
+      const body: Record<string, string | number> = {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: 0,
+        file_paths: JSON.stringify({ [fileName]: args.source }),
+      };
+      const convertTo = convertMap[args.convert_to];
+      if (convertTo) {
+        body.convertto = convertTo;
+      }
+      result = await uploadFile(args.source, body);
+    }
+
+    const items = Array.isArray(result) ? result : [result];
+    const item = items[0] as Record<string, unknown>;
+    const status = item.Status as Record<string, unknown> | undefined;
+
+    if (status?.Code !== 2) {
+      return {
+        content: [{ type: "text", text: formatResult(item) }],
+        isError: status?.Code !== 1,
+      };
+    }
+
+    const origSize = item.OriginalSize as number;
+    const lossySize = item.LossySize as number;
+    const losslessSize = (item.LoselessSize ?? item.LosslessSize) as number;
+
+    const lines: string[] = [
+      `## Image Comparison Report`,
+      ``,
+      `**Source:** ${args.source}`,
+      `**Compression mode:** ${args.compression}`,
+      ``,
+      `### Size Comparison`,
+      ``,
+      `| Format | Size | Savings | URL |`,
+      `|--------|------|---------|-----|`,
+      `| Original | ${formatBytes(origSize)} | — | ${item.OriginalURL} |`,
+      `| ${args.compression} | ${formatBytes(lossySize)} | ${((1 - lossySize / origSize) * 100).toFixed(1)}% | ${item.LossyURL} |`,
+      `| Lossless | ${formatBytes(losslessSize)} | ${((1 - losslessSize / origSize) * 100).toFixed(1)}% | ${item.LosslessURL} |`,
+    ];
+
+    if (item.WebPLossyURL) {
+      const webpLossySize = item.WebPLossySize as number;
+      const webpLosslessSize = (item.WebPLoselessSize ?? item.WebPLosslessSize) as number;
+      lines.push(
+        `| WebP Lossy | ${formatBytes(webpLossySize)} | ${((1 - webpLossySize / origSize) * 100).toFixed(1)}% | ${item.WebPLossyURL} |`
+      );
+      lines.push(
+        `| WebP Lossless | ${formatBytes(webpLosslessSize)} | ${((1 - webpLosslessSize / origSize) * 100).toFixed(1)}% | ${item.WebPLosslessURL} |`
+      );
+    }
+
+    if (item.AVIFLossyURL) {
+      const avifLossySize = item.AVIFLossySize as number;
+      const avifLosslessSize = (item.AVIFLoselessSize ?? item.AVIFLosslessSize) as number;
+      lines.push(
+        `| AVIF Lossy | ${formatBytes(avifLossySize)} | ${((1 - avifLossySize / origSize) * 100).toFixed(1)}% | ${item.AVIFLossyURL} |`
+      );
+      lines.push(
+        `| AVIF Lossless | ${formatBytes(avifLosslessSize)} | ${((1 - avifLosslessSize / origSize) * 100).toFixed(1)}% | ${item.AVIFLosslessURL} |`
+      );
+    }
+
+    // Find the best option
+    const candidates: { name: string; size: number }[] = [
+      { name: `${args.compression}`, size: lossySize },
+      { name: "Lossless", size: losslessSize },
+    ];
+    if (item.WebPLossySize) candidates.push({ name: "WebP Lossy", size: item.WebPLossySize as number });
+    if (item.AVIFLossySize) candidates.push({ name: "AVIF Lossy", size: item.AVIFLossySize as number });
+
+    const best = candidates.reduce((a, b) => (a.size < b.size ? a : b));
+    lines.push(``);
+    lines.push(`### Recommendation`);
+    lines.push(``);
+    lines.push(`**Best option: ${best.name}** — ${formatBytes(best.size)} (${((1 - best.size / origSize) * 100).toFixed(1)}% smaller than original)`);
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ── Tool: optimize-and-save ─────────────────────────────────────────────────
+
+server.tool(
+  "optimize-and-save",
+  "Optimize a single image (URL or local file) and save the optimized result to a local path. " +
+    "Combines optimize + download in one step. If no dest_path is given, replaces the original file (local only).",
+  {
+    source: z.string().describe("Image URL or absolute local file path"),
+    dest_path: z.string().optional().describe("Absolute local path to save the optimized image. If omitted and source is a local file, replaces the original."),
+    compression: z
+      .enum(["lossy", "glossy", "lossless"])
+      .default("lossy")
+      .describe("Compression mode"),
+    convert_to: z
+      .enum(["none", "webp", "avif"])
+      .default("none")
+      .describe("Convert to a different format (downloaded file will be in this format)"),
+    keep_exif: z.boolean().default(false).describe("Preserve EXIF metadata"),
+  },
+  async (args) => {
+    const key = requireApiKey();
+    const lossyMap = { lossy: 1, glossy: 2, lossless: 0 };
+    const convertMap: Record<string, string> = {
+      none: "",
+      webp: "+webp",
+      avif: "+avif",
+    };
+
+    const isUrl = args.source.startsWith("http://") || args.source.startsWith("https://");
+
+    if (!isUrl && !fs.existsSync(args.source)) {
+      return {
+        content: [{ type: "text", text: `Error: File not found: ${args.source}` }],
+        isError: true,
+      };
+    }
+
+    // Determine destination path
+    const destPath = args.dest_path ?? (isUrl ? undefined : args.source);
+    if (!destPath) {
+      return {
+        content: [{ type: "text", text: "Error: dest_path is required when source is a URL." }],
+        isError: true,
+      };
+    }
+
+    let result: unknown;
+
+    if (isUrl) {
+      const body: Record<string, unknown> = {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        resize: 0,
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: args.keep_exif ? 1 : 0,
+        urllist: [args.source],
+      };
+      if (convertMap[args.convert_to]) {
+        body.convertto = convertMap[args.convert_to];
+      }
+      result = await postJson("reducer.php", body);
+    } else {
+      const fileName = path.basename(args.source);
+      const body: Record<string, string | number> = {
+        key,
+        plugin_version: PLUGIN_VERSION,
+        lossy: lossyMap[args.compression],
+        wait: 30,
+        cmyk2rgb: 1,
+        keep_exif: args.keep_exif ? 1 : 0,
+        file_paths: JSON.stringify({ file1: args.source }),
+      };
+      const convertTo = convertMap[args.convert_to];
+      if (convertTo) {
+        body.convertto = convertTo;
+      }
+      result = await uploadFile(args.source, body);
+    }
+
+    const items = Array.isArray(result) ? result : [result];
+    const item = items[0] as Record<string, unknown>;
+    const status = item.Status as Record<string, unknown> | undefined;
+
+    if (status?.Code !== 2) {
+      return {
+        content: [{ type: "text", text: formatResult(item) }],
+        isError: status?.Code !== 1,
+      };
+    }
+
+    // Pick the right URL based on convert_to
+    let downloadUrl: string;
+    let formatLabel: string;
+    if (args.convert_to === "webp" && item.WebPLossyURL) {
+      downloadUrl = (args.compression === "lossless" ? item.WebPLosslessURL : item.WebPLossyURL) as string;
+      formatLabel = `WebP (${args.compression})`;
+    } else if (args.convert_to === "avif" && item.AVIFLossyURL) {
+      downloadUrl = (args.compression === "lossless" ? item.AVIFLosslessURL : item.AVIFLossyURL) as string;
+      formatLabel = `AVIF (${args.compression})`;
+    } else {
+      downloadUrl = (args.compression === "lossless" ? item.LosslessURL : item.LossyURL) as string;
+      formatLabel = args.compression;
+    }
+
+    const dir = path.dirname(destPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    await downloadFile(downloadUrl, destPath);
+    const stat = fs.statSync(destPath);
+    const origSize = item.OriginalSize as number;
+    const savings = origSize > 0 ? ((1 - stat.size / origSize) * 100).toFixed(1) : "0";
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Optimized and saved to ${destPath}\n\nFormat: ${formatLabel}\nOriginal: ${formatBytes(origSize)}\nOptimized: ${formatBytes(stat.size)} (${savings}% saved)`,
         },
       ],
     };
