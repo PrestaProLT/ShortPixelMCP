@@ -14,6 +14,14 @@ const API_KEY = process.env.SHORTPIXEL_API_KEY ?? "";
 const API_BASE = "https://api.shortpixel.com/v2";
 const PLUGIN_VERSION = "MCP10";
 
+// ShortPixel API caps the inline `wait` param at 30 seconds per call.
+const API_INLINE_WAIT_CAP = 30;
+
+// Polling defaults when a job is still queued after the inline wait.
+const DEFAULT_POLL_MAX_WAIT = 180;   // 3 minutes for URL-sourced jobs (no size known)
+const POLL_WAIT_HARD_CAP = 300;      // 5 minutes absolute ceiling
+const POLL_WAIT_MIN = 60;            // never time out before 60s
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function requireApiKey(): string {
@@ -157,15 +165,123 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
-function formatResult(item: Record<string, unknown>): string {
+// ── Polling ─────────────────────────────────────────────────────────────────
+
+/**
+ * Dynamic total wait budget, scaled by file size.
+ * Small images finish in one inline wait; large images (>5 MB) can take minutes.
+ * 60 s base + 20 s per MB, clamped to [POLL_WAIT_MIN, POLL_WAIT_HARD_CAP].
+ */
+function calcMaxWait(fileSizeBytes: number | undefined): number {
+  if (!fileSizeBytes || fileSizeBytes <= 0) return DEFAULT_POLL_MAX_WAIT;
+  const mb = fileSizeBytes / (1024 * 1024);
+  const estimated = Math.ceil(60 + mb * 20);
+  return Math.min(POLL_WAIT_HARD_CAP, Math.max(POLL_WAIT_MIN, estimated));
+}
+
+function getCode(item: Record<string, unknown>): number {
   const status = item.Status as Record<string, unknown> | undefined;
-  const code = Number(status?.Code);
+  return Number(status?.Code);
+}
+
+/**
+ * If an item is queued (Code=1), poll reducer.php using the returned OriginalURL
+ * (the already-uploaded temp file on ShortPixel's CDN) until it's done or the
+ * total deadline is reached. This avoids re-uploading on every retry.
+ *
+ * The original request params are reused verbatim (minus `file_paths`) so the
+ * queue entry matches whatever compression/convert flags were set on upload.
+ */
+async function pollItem(
+  item: Record<string, unknown>,
+  baseBody: Record<string, unknown>,
+  maxTotalSeconds: number
+): Promise<Record<string, unknown>> {
+  if (getCode(item) !== 1) return item;
+
+  const originalUrl = item.OriginalURL as string | undefined;
+  if (!originalUrl) return item;
+
+  // Reuse the original params so ShortPixel returns the right variant,
+  // but swap the file upload for a poll of the already-uploaded URL.
+  const pollBody: Record<string, unknown> = {
+    ...baseBody,
+    urllist: [originalUrl],
+    wait: API_INLINE_WAIT_CAP,
+  };
+  delete pollBody.file_paths;
+
+  const deadline = Date.now() + maxTotalSeconds * 1000;
+  let lastItem = item;
+
+  while (Date.now() < deadline) {
+    const result = await postJson("reducer.php", pollBody);
+    const items = Array.isArray(result) ? result : [result];
+    lastItem = items[0] as Record<string, unknown>;
+    const code = getCode(lastItem);
+    if (code !== 1) return lastItem;
+    // reducer.php already waited up to 30 s inline; loop immediately
+  }
+
+  // Preserve the original OriginalURL so callers can retry manually.
+  if (!lastItem.OriginalURL) lastItem.OriginalURL = originalUrl;
+  return lastItem;
+}
+
+/**
+ * Run a ShortPixel request (upload or URL-based) and poll every queued item
+ * until it completes. Returns the final array of items.
+ */
+async function runAndPoll(opts: {
+  body: Record<string, unknown>;
+  filePath?: string;
+  urlBased?: boolean;
+  maxTotalWait?: number;
+  enablePolling?: boolean;
+}): Promise<Record<string, unknown>[]> {
+  let result: unknown;
+  if (opts.filePath) {
+    result = await uploadFile(opts.filePath, opts.body as Record<string, string | number>);
+  } else {
+    result = await postJson("reducer.php", opts.body);
+  }
+
+  const items = (Array.isArray(result) ? result : [result]) as Record<string, unknown>[];
+
+  if (opts.enablePolling === false) return items;
+
+  let maxWait = opts.maxTotalWait;
+  if (maxWait === undefined) {
+    let fileSize: number | undefined;
+    if (opts.filePath && fs.existsSync(opts.filePath)) {
+      try {
+        fileSize = fs.statSync(opts.filePath).size;
+      } catch {
+        fileSize = undefined;
+      }
+    }
+    maxWait = calcMaxWait(fileSize);
+  }
+
+  // Poll sequentially to stay within ShortPixel's per-request rate limits.
+  const polled: Record<string, unknown>[] = [];
+  for (const item of items) {
+    polled.push(await pollItem(item, opts.body, maxWait));
+  }
+  return polled;
+}
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+
+function formatResult(item: Record<string, unknown>): string {
+  const code = getCode(item);
 
   if (code === 1) {
-    return `⏳ Image queued for processing. Poll again shortly.\nOriginal: ${item.OriginalURL}`;
+    return `⏳ Image still queued after polling. Try again shortly.\nOriginal: ${item.OriginalURL}`;
   }
 
   if (code !== 2) {
+    const status = item.Status as Record<string, unknown> | undefined;
     return `Error (${code}): ${status?.Message ?? "Unknown error"}`;
   }
 
@@ -198,7 +314,7 @@ function formatResult(item: Record<string, unknown>): string {
 
 const server = new McpServer({
   name: "shortpixel-mcp",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 // ── Tool: optimize ──────────────────────────────────────────────────────────
@@ -206,7 +322,8 @@ const server = new McpServer({
 server.tool(
   "optimize",
   "Optimize one or more images by URL. Supports lossy/glossy/lossless compression, " +
-    "WebP/AVIF conversion, resize, and background removal. Returns download URLs for optimized images.",
+    "WebP/AVIF conversion, resize, and background removal. Returns download URLs for optimized images. " +
+    "Polls until done (or max_total_wait seconds elapse) without re-uploading.",
   {
     urls: z.array(z.string().url()).min(1).max(100).describe("Image URLs to optimize (max 100)"),
     compression: z
@@ -230,7 +347,14 @@ server.tool(
       .min(0)
       .max(30)
       .default(20)
-      .describe("Seconds to wait for result (0 = async, 1-30 = wait)"),
+      .describe("Seconds to wait inline on the first API call (0 = async, 1-30 = wait). Polling continues after this if still queued."),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe(`Total seconds to poll before giving up (default: ${DEFAULT_POLL_MAX_WAIT}). Set to 0 to disable polling and return after the inline wait.`),
   },
   async (args) => {
     const key = requireApiKey();
@@ -270,9 +394,13 @@ server.tool(
       body.resize_height = args.resize_height;
     }
 
-    const result = await postJson("reducer.php", body);
-    const items = Array.isArray(result) ? result : [result];
-    const text = items.map((item) => formatResult(item as Record<string, unknown>)).join("\n\n---\n\n");
+    const enablePolling = args.wait !== 0 && args.max_total_wait !== 0;
+    const polled = await runAndPoll({
+      body,
+      maxTotalWait: args.max_total_wait,
+      enablePolling,
+    });
+    const text = polled.map(formatResult).join("\n\n---\n\n");
 
     return { content: [{ type: "text", text }] };
   }
@@ -282,7 +410,8 @@ server.tool(
 
 server.tool(
   "optimize-file",
-  "Upload and optimize a local image file. Use this when the image is not publicly accessible via URL.",
+  "Upload and optimize a local image file. Polls until done (or max_total_wait seconds elapse), " +
+    "without re-uploading on every retry.",
   {
     file_path: z.string().describe("Absolute path to the local image file"),
     compression: z
@@ -300,7 +429,14 @@ server.tool(
       .min(0)
       .max(30)
       .default(30)
-      .describe("Seconds to wait for result"),
+      .describe("Seconds to wait inline on the upload call"),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe("Total seconds to poll before giving up. Defaults to 60 + 20*MB, capped at 300. Set to 0 to disable polling."),
   },
   async (args) => {
     const key = requireApiKey();
@@ -336,9 +472,14 @@ server.tool(
       body.convertto = convertTo;
     }
 
-    const result = await uploadFile(args.file_path, body);
-    const items = Array.isArray(result) ? result : [result];
-    const text = items.map((item) => formatResult(item as Record<string, unknown>)).join("\n\n---\n\n");
+    const enablePolling = args.wait !== 0 && args.max_total_wait !== 0;
+    const polled = await runAndPoll({
+      body,
+      filePath: args.file_path,
+      maxTotalWait: args.max_total_wait,
+      enablePolling,
+    });
+    const text = polled.map(formatResult).join("\n\n---\n\n");
 
     return { content: [{ type: "text", text }] };
   }
@@ -420,8 +561,8 @@ server.tool(
 
 server.tool(
   "batch-optimize",
-  "Optimize all images in a local directory. Uploads each file and returns optimized URLs. " +
-    "Supports filtering by extension.",
+  "Optimize all images in a local directory. Uploads each file once, then polls the same job " +
+    "until it completes (timeout scales with file size). Supports filtering by extension.",
   {
     directory: z.string().describe("Absolute path to directory containing images"),
     extensions: z
@@ -440,6 +581,13 @@ server.tool(
       .boolean()
       .default(false)
       .describe("Download optimized files back, replacing originals"),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe("Total seconds to poll per file before giving up. Defaults to 60 + 20*MB per file."),
   },
   async (args) => {
     const key = requireApiKey();
@@ -485,7 +633,7 @@ server.tool(
         key,
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: 0,
         file_paths: JSON.stringify({ [fileName]: filePath }),
@@ -497,15 +645,17 @@ server.tool(
       }
 
       try {
-        const result = await uploadFile(filePath, body);
-        const items = Array.isArray(result) ? result : [result];
-        const item = items[0] as Record<string, unknown>;
+        const polled = await runAndPoll({
+          body,
+          filePath,
+          maxTotalWait: args.max_total_wait,
+        });
+        const item = polled[0];
         const text = formatResult(item);
 
         // Download back if requested
         if (args.download_result) {
-          const status = item.Status as Record<string, unknown> | undefined;
-          if (Number(status?.Code) === 2 && item.LossyURL) {
+          if (getCode(item) === 2 && item.LossyURL) {
             await downloadFile(item.LossyURL as string, filePath);
             results.push(`${file}: optimized and replaced\n${text}`);
           } else {
@@ -549,6 +699,13 @@ server.tool(
       .default("lossless")
       .describe("Compression mode"),
     dest_path: z.string().describe("Absolute local path to save the resized image"),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe("Total seconds to poll before giving up"),
   },
   async (args) => {
     const key = requireApiKey();
@@ -556,21 +713,22 @@ server.tool(
     const resizeMap = { outer: 1, inner: 3, smart_crop: 4 };
 
     const isUrl = args.source.startsWith("http://") || args.source.startsWith("https://");
-    let result: unknown;
+    let polled: Record<string, unknown>[];
 
     if (isUrl) {
-      result = await postJson("reducer.php", {
+      const body: Record<string, unknown> = {
         key,
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
         resize: resizeMap[args.mode],
         resize_width: args.width,
         resize_height: args.height,
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: 0,
         urllist: [args.source],
-      });
+      };
+      polled = await runAndPoll({ body, maxTotalWait: args.max_total_wait });
     } else {
       if (!fs.existsSync(args.source)) {
         return {
@@ -579,28 +737,27 @@ server.tool(
         };
       }
       const fileName = path.basename(args.source);
-      result = await uploadFile(args.source, {
+      const body: Record<string, string | number> = {
         key,
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
         resize: resizeMap[args.mode],
         resize_width: args.width,
         resize_height: args.height,
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: 0,
         file_paths: JSON.stringify({ [fileName]: args.source }),
-      });
+      };
+      polled = await runAndPoll({ body, filePath: args.source, maxTotalWait: args.max_total_wait });
     }
 
-    const items = Array.isArray(result) ? result : [result];
-    const item = items[0] as Record<string, unknown>;
-    const status = item.Status as Record<string, unknown> | undefined;
+    const item = polled[0];
 
-    if (Number(status?.Code) !== 2) {
+    if (getCode(item) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: Number(status?.Code) !== 1,
+        isError: getCode(item) !== 1,
       };
     }
 
@@ -641,6 +798,13 @@ server.tool(
       .enum(["none", "webp", "avif", "webp+avif"])
       .default("webp+avif")
       .describe("Also compare converted formats"),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe("Total seconds to poll before giving up"),
   },
   async (args) => {
     const key = requireApiKey();
@@ -653,7 +817,7 @@ server.tool(
     };
 
     const isUrl = args.source.startsWith("http://") || args.source.startsWith("https://");
-    let result: unknown;
+    let polled: Record<string, unknown>[];
 
     if (isUrl) {
       const body: Record<string, unknown> = {
@@ -661,7 +825,7 @@ server.tool(
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
         resize: 0,
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: 0,
         urllist: [args.source],
@@ -669,7 +833,7 @@ server.tool(
       if (convertMap[args.convert_to]) {
         body.convertto = convertMap[args.convert_to];
       }
-      result = await postJson("reducer.php", body);
+      polled = await runAndPoll({ body, maxTotalWait: args.max_total_wait });
     } else {
       if (!fs.existsSync(args.source)) {
         return {
@@ -682,7 +846,7 @@ server.tool(
         key,
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: 0,
         file_paths: JSON.stringify({ [fileName]: args.source }),
@@ -691,17 +855,15 @@ server.tool(
       if (convertTo) {
         body.convertto = convertTo;
       }
-      result = await uploadFile(args.source, body);
+      polled = await runAndPoll({ body, filePath: args.source, maxTotalWait: args.max_total_wait });
     }
 
-    const items = Array.isArray(result) ? result : [result];
-    const item = items[0] as Record<string, unknown>;
-    const status = item.Status as Record<string, unknown> | undefined;
+    const item = polled[0];
 
-    if (Number(status?.Code) !== 2) {
+    if (getCode(item) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: Number(status?.Code) !== 1,
+        isError: getCode(item) !== 1,
       };
     }
 
@@ -769,7 +931,7 @@ server.tool(
 server.tool(
   "optimize-and-save",
   "Optimize a single image (URL or local file) and save the optimized result to a local path. " +
-    "Combines optimize + download in one step. If no dest_path is given, replaces the original file (local only).",
+    "Combines optimize + download + polling in one step. If no dest_path is given, replaces the original file (local only).",
   {
     source: z.string().describe("Image URL or absolute local file path"),
     dest_path: z.string().optional().describe("Absolute local path to save the optimized image. If omitted and source is a local file, replaces the original."),
@@ -782,6 +944,13 @@ server.tool(
       .default("none")
       .describe("Convert to a different format (downloaded file will be in this format)"),
     keep_exif: z.boolean().default(false).describe("Preserve EXIF metadata"),
+    max_total_wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(POLL_WAIT_HARD_CAP)
+      .optional()
+      .describe("Total seconds to poll before giving up. Defaults to 60 + 20*MB, capped at 300."),
   },
   async (args) => {
     const key = requireApiKey();
@@ -810,7 +979,7 @@ server.tool(
       };
     }
 
-    let result: unknown;
+    let polled: Record<string, unknown>[];
 
     if (isUrl) {
       const body: Record<string, unknown> = {
@@ -818,7 +987,7 @@ server.tool(
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
         resize: 0,
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: args.keep_exif ? 1 : 0,
         urllist: [args.source],
@@ -826,14 +995,14 @@ server.tool(
       if (convertMap[args.convert_to]) {
         body.convertto = convertMap[args.convert_to];
       }
-      result = await postJson("reducer.php", body);
+      polled = await runAndPoll({ body, maxTotalWait: args.max_total_wait });
     } else {
       const fileName = path.basename(args.source);
       const body: Record<string, string | number> = {
         key,
         plugin_version: PLUGIN_VERSION,
         lossy: lossyMap[args.compression],
-        wait: 30,
+        wait: API_INLINE_WAIT_CAP,
         cmyk2rgb: 1,
         keep_exif: args.keep_exif ? 1 : 0,
         file_paths: JSON.stringify({ file1: args.source }),
@@ -842,17 +1011,15 @@ server.tool(
       if (convertTo) {
         body.convertto = convertTo;
       }
-      result = await uploadFile(args.source, body);
+      polled = await runAndPoll({ body, filePath: args.source, maxTotalWait: args.max_total_wait });
     }
 
-    const items = Array.isArray(result) ? result : [result];
-    const item = items[0] as Record<string, unknown>;
-    const status = item.Status as Record<string, unknown> | undefined;
+    const item = polled[0];
 
-    if (Number(status?.Code) !== 2) {
+    if (getCode(item) !== 2) {
       return {
         content: [{ type: "text", text: formatResult(item) }],
-        isError: Number(status?.Code) !== 1,
+        isError: getCode(item) !== 1,
       };
     }
 
